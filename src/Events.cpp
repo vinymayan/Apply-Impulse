@@ -85,8 +85,22 @@ static void DisableCollisionDamage(RE::bhkCharacterController* a_charController)
 
 static void RestoreCollisionDamage(RE::bhkCharacterController* a_charController)
 {
+	if (!a_charController) {
+		return;
+	}
+
 	a_charController->flags.set(RE::CHARACTER_FLAGS::kHitDamage);
 	a_charController->flags.set(RE::CHARACTER_FLAGS::kRecordHits);
+}
+
+static void RestoreDefaultFallPhysics(RE::bhkCharacterController* a_charController)
+{
+	if (!a_charController) {
+		return;
+	}
+
+	a_charController->gravity = 1.0f;
+	a_charController->fallTime = 0.0f;
 }
 
 static float GetActorHealth(RE::Actor* a_actor)
@@ -212,7 +226,9 @@ void ProcessActorImpulses(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
 	RE::hkVector4 totalTargetVel{ 0.0f, 0.0f, 0.0f, 0.0f };
 	bool anyHorizontalActive = false;
 	bool anyVerticalActive = false;
+	bool anyVerticalRemaining = false;
 	bool anyNoDamageActive = false; // <--- Rastreia se algum impulso ativo bloqueia o dano
+	bool hasRemainingImpulses = false;
 
 	{
 		std::lock_guard<std::mutex> lock(g_ImpulseMutex);
@@ -221,11 +237,9 @@ void ProcessActorImpulses(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
 		if (it == g_ActiveImpulses.end() || it->second.empty()) {
 			if (!g_NoDamageLandingGrace.contains(a_actorID)) {
 				g_ActiveLoops.erase(a_actorID);
-				if (charController) {
-					charController->gravity = 1.0f;
-					// Garante a restauração das flags originais ao limpar o loop
-					RestoreCollisionDamage(charController);
-				}
+				RestoreDefaultFallPhysics(charController);
+				// Garante a restauração das flags originais ao limpar o loop
+				RestoreCollisionDamage(charController);
 				return;
 			}
 		}
@@ -257,20 +271,18 @@ void ProcessActorImpulses(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
 
 					if (impulse.elapsedFrames < impulse.totalFrames) {
 						remainingImpulses.push_back(impulse);
+						if (impulse.hasVertical) {
+							anyVerticalRemaining = true;
+						}
 					}
 				}
 			}
 
-			if (remainingImpulses.empty()) {
+			hasRemainingImpulses = !remainingImpulses.empty();
+			if (!hasRemainingImpulses) {
 				g_ActiveImpulses.erase(a_actorID);
 				if (!g_NoDamageLandingGrace.contains(a_actorID)) {
 					g_ActiveLoops.erase(a_actorID);
-					if (charController) {
-						charController->gravity = 1.0f;
-						// Restaura o comportamento padrão ao finalizar todos os impulsos
-						RestoreCollisionDamage(charController);
-					}
-					return;
 				}
 			}
 			else {
@@ -284,6 +296,8 @@ void ProcessActorImpulses(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
 	}
 
 	if (!anyHorizontalActive && !anyVerticalActive) {
+		RestoreDefaultFallPhysics(charController);
+
 		if (UpdateNoDamageLandingProtection(a_actorID, charController)) {
 			Utils::DelayedDispatcher::Get().PostDelayed(std::chrono::milliseconds(5), [a_actorHandle, a_actorID]() {
 				SKSE::GetTaskInterface()->AddTask([a_actorHandle, a_actorID]() {
@@ -305,7 +319,7 @@ void ProcessActorImpulses(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
 		charController->wantState = RE::hkpCharacterStateType::kInAir;
 		charController->context.currentState = RE::hkpCharacterStateType::kInAir;
 
-		charController->gravity = anyVerticalActive ? 0.0f : 1.0f;
+		charController->gravity = anyVerticalActive && anyVerticalRemaining ? 0.0f : 1.0f;
 		charController->fallTime = 0.0f;
 
 		// --- CONTROLE DINÂMICO DE DANO ---
@@ -339,11 +353,18 @@ void ProcessActorImpulses(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
 		charController->velocityMod = currentVel;
 	}
 
+	if (!hasRemainingImpulses && !IsCollisionDamageSuppressed(actorPtr.get())) {
+		if (charController) {
+			RestoreCollisionDamage(charController);
+		}
+		return;
+	}
+
 	Utils::DelayedDispatcher::Get().PostDelayed(std::chrono::milliseconds(5), [a_actorHandle, a_actorID]() {
 		SKSE::GetTaskInterface()->AddTask([a_actorHandle, a_actorID]() {
 			ProcessActorImpulses(a_actorHandle, a_actorID);
 			});
-		});
+	});
 }
 
 void ApplyCustomVelocityImpulse(RE::Actor* a_actor, float a_x, float a_y, float a_z, float a_time, bool a_inflictDamage)

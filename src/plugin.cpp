@@ -1,6 +1,38 @@
 ﻿#include "logger.h"
 #include "PayloadAPI.h"
 #include "Events.h"
+#include "Hooks.h"
+
+namespace PapyrusAPI
+{
+	void ApplyCustomVelocityImpulse(RE::StaticFunctionTag*, RE::Actor* a_actor, float a_x, float a_y, float a_z, float a_time, bool a_inflictDamage)
+	{
+		::ApplyCustomVelocityImpulse(a_actor, a_x, a_y, a_z, a_time, a_inflictDamage);
+	}
+
+	void ApplyCustomRotation(RE::StaticFunctionTag*, RE::Actor* a_actor, float a_yawDegrees, float a_time)
+	{
+		::ApplyCustomRotation(a_actor, a_yawDegrees, a_time);
+	}
+
+	bool IsCollisionDamageSuppressed(RE::StaticFunctionTag*, RE::Actor* a_actor)
+	{
+		return ::IsCollisionDamageSuppressed(a_actor);
+	}
+
+	void RestoreSuppressedCollisionHealth(RE::StaticFunctionTag*, RE::Actor* a_actor)
+	{
+		::RestoreSuppressedCollisionHealth(a_actor);
+	}
+
+	bool Bind(RE::BSScript::IVirtualMachine* a_vm)
+	{
+		a_vm->RegisterFunction("ApplyCustomVelocityImpulse", "ApplyImpulse", ApplyCustomVelocityImpulse);
+		a_vm->RegisterFunction("ApplyCustomRotation", "ApplyImpulse", ApplyCustomRotation);
+		a_vm->RegisterFunction("IsCollisionDamageSuppressed", "ApplyImpulse", IsCollisionDamageSuppressed);
+		return true;
+	}
+}
 
 // Crie uma classe concreta que herda da interface e chama suas funções locais
 class FFCInterfaceImpl : public FFC_API::IFFCInterface {
@@ -13,6 +45,10 @@ public:
     void ApplyCustomRotation(RE::Actor* a_actor, float a_yawDegrees, float a_time) override {
         // Chama a sua função original definida no Events.cpp
         ::ApplyCustomRotation(a_actor, a_yawDegrees, a_time);
+    }
+
+    bool IsCollisionDamageSuppressed(RE::Actor* a_actor) override {
+        return ::IsCollisionDamageSuppressed(a_actor);
     }
 };
 
@@ -47,6 +83,7 @@ void OnMessage(SKSE::MessagingInterface::Message* message) {
         if (SKSE::GetMessagingInterface()->RegisterListener("PayloadInterpreter", PayloadInterpreterMessageListener)) {
             SKSE::log::info("Listener para PayloadInterpreter registrado com sucesso.");
         }
+        Hooks::Install();
     }
     if (message->type == FFC_API::kMessage_RequestAPI) {
         // Responde enviando o ponteiro da sua API de volta
@@ -62,6 +99,8 @@ SKSEPluginLoad(const SKSE::LoadInterface *skse) {
     SetupLog();
     logger::info("Plugin loaded");
     SKSE::Init(skse);
+    Hooks::Install();
     SKSE::GetMessagingInterface()->RegisterListener(OnMessage);
+    SKSE::GetPapyrusInterface()->Register(PapyrusAPI::Bind);
     return true;
 }

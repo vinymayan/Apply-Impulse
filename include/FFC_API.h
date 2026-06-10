@@ -1,5 +1,7 @@
 ﻿#pragma once
 
+#include <string_view>
+
 namespace FFC_API {
     constexpr const char* PluginName = "ApplyImpulse";
     constexpr uint32_t kMessage_RequestAPI = 7075;
@@ -13,6 +15,9 @@ namespace FFC_API {
 
         // Aplica uma rotação customizada no ator
         virtual void ApplyCustomRotation(RE::Actor* a_actor, float a_yawDegrees, float a_time) = 0;
+
+        // Retorna se o ator esta temporariamente protegido contra dano de colisao/queda
+        virtual bool IsCollisionDamageSuppressed(RE::Actor* a_actor) = 0;
     };
 
     inline IFFCInterface* _API = nullptr;

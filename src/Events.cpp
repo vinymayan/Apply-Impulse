@@ -47,9 +47,16 @@ struct ActiveImpulse {
 	bool inflictDamage = true;
 };
 
+struct NoDamageLandingProtection {
+	int graceFrames = 0;
+	float protectedHealth = 0.0f;
+};
+
 static std::map<RE::FormID, std::vector<ActiveImpulse>> g_ActiveImpulses;
 static std::set<RE::FormID> g_ActiveLoops;
+static std::map<RE::FormID, NoDamageLandingProtection> g_NoDamageLandingGrace;
 static std::mutex g_ImpulseMutex;
+static constexpr int kNoDamageLandingGraceFrames = 12;
 
 // --- ESTRUTURAS E REGISTROS DE ROTAÇÃO SUAVE ---
 struct ActiveRotation {
@@ -63,6 +70,127 @@ static std::map<RE::FormID, std::vector<ActiveRotation>> g_ActiveRotations;
 static std::set<RE::FormID> g_ActiveRotationLoops;
 static std::mutex g_RotationMutex;
 
+static bool IsActorGrounded(RE::bhkCharacterController* a_charController)
+{
+	return a_charController->flags.all(RE::CHARACTER_FLAGS::kSupport) ||
+	       a_charController->context.currentState == RE::hkpCharacterStateType::kOnGround;
+}
+
+static void DisableCollisionDamage(RE::bhkCharacterController* a_charController)
+{
+	a_charController->fallTime = 0.0f;
+	a_charController->flags.reset(RE::CHARACTER_FLAGS::kHitDamage);
+	a_charController->flags.reset(RE::CHARACTER_FLAGS::kRecordHits);
+}
+
+static void RestoreCollisionDamage(RE::bhkCharacterController* a_charController)
+{
+	a_charController->flags.set(RE::CHARACTER_FLAGS::kHitDamage);
+	a_charController->flags.set(RE::CHARACTER_FLAGS::kRecordHits);
+}
+
+static float GetActorHealth(RE::Actor* a_actor)
+{
+	auto* avOwner = a_actor ? a_actor->AsActorValueOwner() : nullptr;
+	return avOwner ? avOwner->GetActorValue(RE::ActorValue::kHealth) : 0.0f;
+}
+
+static void RestoreSuppressedCollisionHealthLocked(RE::Actor* a_actor)
+{
+	if (!a_actor) {
+		return;
+	}
+
+	auto it = g_NoDamageLandingGrace.find(a_actor->GetFormID());
+	if (it == g_NoDamageLandingGrace.end()) {
+		return;
+	}
+
+	auto* avOwner = a_actor->AsActorValueOwner();
+	if (!avOwner) {
+		return;
+	}
+
+	const float currentHealth = avOwner->GetActorValue(RE::ActorValue::kHealth);
+	const float protectedHealth = it->second.protectedHealth;
+	if (currentHealth < protectedHealth) {
+		avOwner->RestoreActorValue(RE::ActorValue::kHealth, protectedHealth - currentHealth);
+		SKSE::log::debug(
+			"FFC: Health restaurada durante protecao de colisao actor={:08X}, current={}, protected={}",
+			a_actor->GetFormID(),
+			currentHealth,
+			protectedHealth);
+	}
+}
+
+static void StartNoDamageLandingProtection(RE::FormID a_actorID, RE::Actor* a_actor)
+{
+	const float currentHealth = GetActorHealth(a_actor);
+	auto& protection = g_NoDamageLandingGrace[a_actorID];
+	const bool wasInactive = protection.graceFrames <= 0;
+	const float previousProtectedHealth = protection.protectedHealth;
+	protection.graceFrames = kNoDamageLandingGraceFrames;
+	protection.protectedHealth = std::max(protection.protectedHealth, currentHealth);
+	if (wasInactive || protection.protectedHealth != previousProtectedHealth) {
+		SKSE::log::debug(
+			"FFC: protecao de colisao iniciada/renovada actor={:08X}, currentHealth={}, protectedHealth={}",
+			a_actorID,
+			currentHealth,
+			protection.protectedHealth);
+	}
+}
+
+static bool UpdateNoDamageLandingProtection(RE::FormID a_actorID, RE::bhkCharacterController* a_charController)
+{
+	if (!a_charController) {
+		std::lock_guard<std::mutex> lock(g_ImpulseMutex);
+		g_NoDamageLandingGrace.erase(a_actorID);
+		return false;
+	}
+
+	DisableCollisionDamage(a_charController);
+
+	std::lock_guard<std::mutex> lock(g_ImpulseMutex);
+	auto it = g_NoDamageLandingGrace.find(a_actorID);
+	if (it == g_NoDamageLandingGrace.end()) {
+		return false;
+	}
+
+	if (IsActorGrounded(a_charController)) {
+		it->second.graceFrames--;
+		if (it->second.graceFrames <= 0) {
+			g_NoDamageLandingGrace.erase(it);
+			RestoreCollisionDamage(a_charController);
+			return false;
+		}
+	}
+	else {
+		it->second.graceFrames = kNoDamageLandingGraceFrames;
+	}
+
+	return true;
+}
+
+bool IsCollisionDamageSuppressed(RE::Actor* a_actor)
+{
+	if (!a_actor) {
+		return false;
+	}
+
+	std::lock_guard<std::mutex> lock(g_ImpulseMutex);
+	return g_NoDamageLandingGrace.contains(a_actor->GetFormID());
+}
+
+void RestoreSuppressedCollisionHealth(RE::Actor* a_actor)
+{
+	if (!a_actor) {
+		return;
+	}
+
+	std::lock_guard<std::mutex> lock(g_ImpulseMutex);
+	RestoreSuppressedCollisionHealthLocked(a_actor);
+}
+
 // =========================================================================
 // SISTEMA DE IMPULSO (FORCE) - DISTRIBUIÇÃO CORRIGIDA FRAME-A-FRAME
 // =========================================================================
@@ -74,6 +202,7 @@ void ProcessActorImpulses(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
 		std::lock_guard<std::mutex> lock(g_ImpulseMutex);
 		g_ActiveImpulses.erase(a_actorID);
 		g_ActiveLoops.erase(a_actorID);
+		g_NoDamageLandingGrace.erase(a_actorID);
 		return;
 	}
 
@@ -90,58 +219,83 @@ void ProcessActorImpulses(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
 		auto it = g_ActiveImpulses.find(a_actorID);
 
 		if (it == g_ActiveImpulses.end() || it->second.empty()) {
-			g_ActiveLoops.erase(a_actorID);
-			if (charController) {
-				charController->gravity = 1.0f;
-				// Garante a restauração das flags originais ao limpar o loop
-				charController->flags.set(RE::CHARACTER_FLAGS::kHitDamage);
-				charController->flags.set(RE::CHARACTER_FLAGS::kRecordHits);
-			}
-			return;
-		}
-
-		for (auto& impulse : it->second) {
-			if (impulse.elapsedFrames < impulse.totalFrames) {
-				impulse.elapsedFrames++;
-
-				if (impulse.isSmooth) {
-					float progress = static_cast<float>(impulse.elapsedFrames) / static_cast<float>(impulse.totalFrames);
-					float easedMultiplier = GetEasingProgress(progress);
-
-					totalTargetVel.quad.m128_f32[0] += impulse.totalVelocity.quad.m128_f32[0] * easedMultiplier;
-					totalTargetVel.quad.m128_f32[1] += impulse.totalVelocity.quad.m128_f32[1] * easedMultiplier;
-					totalTargetVel.quad.m128_f32[2] += impulse.totalVelocity.quad.m128_f32[2] * easedMultiplier;
+			if (!g_NoDamageLandingGrace.contains(a_actorID)) {
+				g_ActiveLoops.erase(a_actorID);
+				if (charController) {
+					charController->gravity = 1.0f;
+					// Garante a restauração das flags originais ao limpar o loop
+					RestoreCollisionDamage(charController);
 				}
-				else {
-					totalTargetVel.quad.m128_f32[0] += impulse.totalVelocity.quad.m128_f32[0];
-					totalTargetVel.quad.m128_f32[1] += impulse.totalVelocity.quad.m128_f32[1];
-					totalTargetVel.quad.m128_f32[2] += impulse.totalVelocity.quad.m128_f32[2];
-				}
-
-				if (impulse.hasHorizontal) { anyHorizontalActive = true; }
-				if (impulse.hasVertical) { anyVerticalActive = true; }
-				if (!impulse.inflictDamage) { anyNoDamageActive = true; } // <--- Ativa o bloqueio de dano
-
-				if (impulse.elapsedFrames < impulse.totalFrames) {
-					remainingImpulses.push_back(impulse);
-				}
+				return;
 			}
-		}
-
-		if (remainingImpulses.empty()) {
-			g_ActiveImpulses.erase(a_actorID);
-			g_ActiveLoops.erase(a_actorID);
-			if (charController) {
-				charController->gravity = 1.0f;
-				// Restaura o comportamento padrão ao finalizar todos os impulsos
-				charController->flags.set(RE::CHARACTER_FLAGS::kHitDamage);
-				charController->flags.set(RE::CHARACTER_FLAGS::kRecordHits);
-			}
-			return;
 		}
 		else {
-			it->second = remainingImpulses;
+			for (auto& impulse : it->second) {
+				if (impulse.elapsedFrames < impulse.totalFrames) {
+					impulse.elapsedFrames++;
+
+					if (impulse.isSmooth) {
+						float progress = static_cast<float>(impulse.elapsedFrames) / static_cast<float>(impulse.totalFrames);
+						float easedMultiplier = GetEasingProgress(progress);
+
+						totalTargetVel.quad.m128_f32[0] += impulse.totalVelocity.quad.m128_f32[0] * easedMultiplier;
+						totalTargetVel.quad.m128_f32[1] += impulse.totalVelocity.quad.m128_f32[1] * easedMultiplier;
+						totalTargetVel.quad.m128_f32[2] += impulse.totalVelocity.quad.m128_f32[2] * easedMultiplier;
+					}
+					else {
+						totalTargetVel.quad.m128_f32[0] += impulse.totalVelocity.quad.m128_f32[0];
+						totalTargetVel.quad.m128_f32[1] += impulse.totalVelocity.quad.m128_f32[1];
+						totalTargetVel.quad.m128_f32[2] += impulse.totalVelocity.quad.m128_f32[2];
+					}
+
+					if (impulse.hasHorizontal) { anyHorizontalActive = true; }
+					if (impulse.hasVertical) { anyVerticalActive = true; }
+					if (!impulse.inflictDamage) {
+						anyNoDamageActive = true; // <--- Ativa o bloqueio de dano
+						StartNoDamageLandingProtection(a_actorID, actorPtr.get());
+					}
+
+					if (impulse.elapsedFrames < impulse.totalFrames) {
+						remainingImpulses.push_back(impulse);
+					}
+				}
+			}
+
+			if (remainingImpulses.empty()) {
+				g_ActiveImpulses.erase(a_actorID);
+				if (!g_NoDamageLandingGrace.contains(a_actorID)) {
+					g_ActiveLoops.erase(a_actorID);
+					if (charController) {
+						charController->gravity = 1.0f;
+						// Restaura o comportamento padrão ao finalizar todos os impulsos
+						RestoreCollisionDamage(charController);
+					}
+					return;
+				}
+			}
+			else {
+				it->second = remainingImpulses;
+			}
 		}
+	}
+
+	if (IsCollisionDamageSuppressed(actorPtr.get())) {
+		RestoreSuppressedCollisionHealth(actorPtr.get());
+	}
+
+	if (!anyHorizontalActive && !anyVerticalActive) {
+		if (UpdateNoDamageLandingProtection(a_actorID, charController)) {
+			Utils::DelayedDispatcher::Get().PostDelayed(std::chrono::milliseconds(5), [a_actorHandle, a_actorID]() {
+				SKSE::GetTaskInterface()->AddTask([a_actorHandle, a_actorID]() {
+					ProcessActorImpulses(a_actorHandle, a_actorID);
+					});
+				});
+			return;
+		}
+
+		std::lock_guard<std::mutex> lock(g_ImpulseMutex);
+		g_ActiveLoops.erase(a_actorID);
+		return;
 	}
 
 	if (charController) {
@@ -156,12 +310,10 @@ void ProcessActorImpulses(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
 
 		// --- CONTROLE DINÂMICO DE DANO ---
 		if (anyNoDamageActive) {
-			charController->flags.reset(RE::CHARACTER_FLAGS::kHitDamage);
-			charController->flags.reset(RE::CHARACTER_FLAGS::kRecordHits);
+			DisableCollisionDamage(charController);
 		}
 		else {
-			charController->flags.set(RE::CHARACTER_FLAGS::kHitDamage);
-			charController->flags.set(RE::CHARACTER_FLAGS::kRecordHits);
+			RestoreCollisionDamage(charController);
 		}
 		// ---------------------------------
 
@@ -239,8 +391,7 @@ void ApplyCustomVelocityImpulse(RE::Actor* a_actor, float a_x, float a_y, float 
 
 	// --- DESATIVAÇÃO DE DANO NO FRAME ZERO ---
 	if (!a_inflictDamage) {
-		charController->flags.reset(RE::CHARACTER_FLAGS::kHitDamage);
-		charController->flags.reset(RE::CHARACTER_FLAGS::kRecordHits);
+		DisableCollisionDamage(charController);
 	}
 	// -----------------------------------------
 
@@ -271,6 +422,10 @@ void ApplyCustomVelocityImpulse(RE::Actor* a_actor, float a_x, float a_y, float 
 
 	{
 		std::lock_guard<std::mutex> lock(g_ImpulseMutex);
+		if (!a_inflictDamage) {
+			StartNoDamageLandingProtection(actorID, a_actor);
+		}
+
 		// Adiciona a_inflictDamage à tupla armazenada
 		g_ActiveImpulses[actorID].push_back({ impulseVel, hasHoriz, hasVert, 1, durationFrames, isSmooth, a_inflictDamage });
 
@@ -429,7 +584,7 @@ void ApplyImpulseFFC::Process(RE::TESObjectREFR* a_holder, const std::string_vie
 {
 	auto actor = a_holder ? a_holder->As<RE::Actor>() : nullptr;
 	if (!actor) return;
-	logger::info("string_view recebida (Force): {}", a_payload);
+	logger::debug("string_view recebida (Force): {}", a_payload);
 
 	auto args = SplitString(a_payload, '|');
 	if (args.empty()) {
@@ -470,7 +625,7 @@ void ApplyRotationFFCHandler::Process(RE::TESObjectREFR* a_holder, const std::st
 {
 	auto actor = a_holder ? a_holder->As<RE::Actor>() : nullptr;
 	if (!actor) return;
-	logger::info("string_view recebida (Rotation): {}", a_payload);
+	logger::debug("string_view recebida (Rotation): {}", a_payload);
 	auto args = SplitString(a_payload, '|');
 	if (args.empty()) {
 		SKSE::log::error("ApplyRotationFFC: O payload está vazio.");
@@ -486,7 +641,7 @@ void ApplyRotationFFCHandler::Process(RE::TESObjectREFR* a_holder, const std::st
 		}
 
 		ApplyCustomRotation(actor, yawDegrees, time);
-		SKSE::log::info("ApplyRotationFFC: Rotação processada [Graus:{}, Tempo:{}s] no ator {:X}", yawDegrees, time, actor->GetFormID());
+		SKSE::log::debug("ApplyRotationFFC: Rotação processada [Graus:{}, Tempo:{}s] no ator {:X}", yawDegrees, time, actor->GetFormID());
 	}
 	catch (...) {
 		SKSE::log::error("ApplyRotationFFC: Erro crítico ao converter valor de rotação: {}", a_payload);

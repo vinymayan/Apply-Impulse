@@ -10,6 +10,20 @@ namespace PapyrusAPI
 		::ApplyCustomVelocityImpulse(a_actor, a_x, a_y, a_z, a_time, a_inflictDamage);
 	}
 
+	void ApplyCustomVelocityImpulseMomentum(
+		RE::StaticFunctionTag*,
+		RE::Actor* a_actor,
+		float a_x,
+		float a_y,
+		float a_z,
+		float a_time,
+		bool a_inflictDamage,
+		bool a_allowMomentumHorizontal,
+		bool a_allowMomentumVertical)
+	{
+		::ApplyCustomVelocityImpulse(a_actor, a_x, a_y, a_z, a_time, a_inflictDamage, a_allowMomentumHorizontal, a_allowMomentumVertical);
+	}
+
 	void ApplyCustomRotation(RE::StaticFunctionTag*, RE::Actor* a_actor, float a_yawDegrees, float a_time)
 	{
 		::ApplyCustomRotation(a_actor, a_yawDegrees, a_time);
@@ -28,6 +42,7 @@ namespace PapyrusAPI
 	bool Bind(RE::BSScript::IVirtualMachine* a_vm)
 	{
 		a_vm->RegisterFunction("ApplyCustomVelocityImpulse", "ApplyImpulse", ApplyCustomVelocityImpulse);
+		a_vm->RegisterFunction("ApplyCustomVelocityImpulseMomentum", "ApplyImpulse", ApplyCustomVelocityImpulseMomentum);
 		a_vm->RegisterFunction("ApplyCustomRotation", "ApplyImpulse", ApplyCustomRotation);
 		a_vm->RegisterFunction("IsCollisionDamageSuppressed", "ApplyImpulse", IsCollisionDamageSuppressed);
 		return true;
@@ -41,6 +56,18 @@ public:
         // Chama a sua função original definida no Events.cpp com a nova flag
         ::ApplyCustomVelocityImpulse(a_actor, a_x, a_y, a_z, a_time, a_inflictDamage);
     }
+
+	void ApplyCustomVelocityImpulseMomentum(
+		RE::Actor* a_actor,
+		float a_x,
+		float a_y,
+		float a_z,
+		float a_time,
+		bool a_inflictDamage,
+		bool a_allowMomentumHorizontal,
+		bool a_allowMomentumVertical) override {
+		::ApplyCustomVelocityImpulse(a_actor, a_x, a_y, a_z, a_time, a_inflictDamage, a_allowMomentumHorizontal, a_allowMomentumVertical);
+	}
 
     void ApplyCustomRotation(RE::Actor* a_actor, float a_yawDegrees, float a_time) override {
         // Chama a sua função original definida no Events.cpp

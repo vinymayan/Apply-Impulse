@@ -41,8 +41,8 @@ struct ActiveImpulse {
 	RE::hkVector4 totalVelocity; // Força total final alvo
 	bool hasHorizontal = false;
 	bool hasVertical = false;
-	int elapsedFrames = 0;       // Quantos frames já se passaram
-	int totalFrames = 15;        // Total de frames que o impulso deve durar
+	std::chrono::steady_clock::time_point startTime{};
+	float durationSeconds = 0.0f;
 	bool isSmooth = false;
 	bool inflictDamage = true;
 };
@@ -57,6 +57,26 @@ static std::set<RE::FormID> g_ActiveLoops;
 static std::map<RE::FormID, NoDamageLandingProtection> g_NoDamageLandingGrace;
 static std::mutex g_ImpulseMutex;
 static constexpr int kNoDamageLandingGraceFrames = 12;
+
+static void RemoveMomentumChannels(std::vector<ActiveImpulse>& a_impulses, bool a_clearHorizontal, bool a_clearVertical)
+{
+	for (auto& impulse : a_impulses) {
+		if (a_clearHorizontal) {
+			impulse.totalVelocity.quad.m128_f32[0] = 0.0f;
+			impulse.totalVelocity.quad.m128_f32[1] = 0.0f;
+			impulse.hasHorizontal = false;
+		}
+
+		if (a_clearVertical) {
+			impulse.totalVelocity.quad.m128_f32[2] = 0.0f;
+			impulse.hasVertical = false;
+		}
+	}
+
+	std::erase_if(a_impulses, [](const ActiveImpulse& impulse) {
+		return !impulse.hasHorizontal && !impulse.hasVertical;
+	});
+}
 
 // --- ESTRUTURAS E REGISTROS DE ROTAÇÃO SUAVE ---
 struct ActiveRotation {
@@ -222,6 +242,7 @@ void ProcessActorImpulses(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
 
 	auto* charController = actorPtr->GetCharController();
 	std::vector<ActiveImpulse> remainingImpulses;
+	const auto now = std::chrono::steady_clock::now();
 
 	RE::hkVector4 totalTargetVel{ 0.0f, 0.0f, 0.0f, 0.0f };
 	bool anyHorizontalActive = false;
@@ -245,36 +266,37 @@ void ProcessActorImpulses(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
 		}
 		else {
 			for (auto& impulse : it->second) {
-				if (impulse.elapsedFrames < impulse.totalFrames) {
-					impulse.elapsedFrames++;
+				const float elapsedSeconds = std::chrono::duration<float>(now - impulse.startTime).count();
+				const float durationSeconds = std::max(impulse.durationSeconds, 0.001f);
+				const bool stillRunning = elapsedSeconds < durationSeconds;
+				if (!stillRunning) {
+					continue;
+				}
 
-					if (impulse.isSmooth) {
-						float progress = static_cast<float>(impulse.elapsedFrames) / static_cast<float>(impulse.totalFrames);
-						float easedMultiplier = GetEasingProgress(progress);
+				if (impulse.isSmooth) {
+					float progress = elapsedSeconds / durationSeconds;
+					float easedMultiplier = GetEasingProgress(progress);
 
-						totalTargetVel.quad.m128_f32[0] += impulse.totalVelocity.quad.m128_f32[0] * easedMultiplier;
-						totalTargetVel.quad.m128_f32[1] += impulse.totalVelocity.quad.m128_f32[1] * easedMultiplier;
-						totalTargetVel.quad.m128_f32[2] += impulse.totalVelocity.quad.m128_f32[2] * easedMultiplier;
-					}
-					else {
-						totalTargetVel.quad.m128_f32[0] += impulse.totalVelocity.quad.m128_f32[0];
-						totalTargetVel.quad.m128_f32[1] += impulse.totalVelocity.quad.m128_f32[1];
-						totalTargetVel.quad.m128_f32[2] += impulse.totalVelocity.quad.m128_f32[2];
-					}
+					totalTargetVel.quad.m128_f32[0] += impulse.totalVelocity.quad.m128_f32[0] * easedMultiplier;
+					totalTargetVel.quad.m128_f32[1] += impulse.totalVelocity.quad.m128_f32[1] * easedMultiplier;
+					totalTargetVel.quad.m128_f32[2] += impulse.totalVelocity.quad.m128_f32[2] * easedMultiplier;
+				}
+				else {
+					totalTargetVel.quad.m128_f32[0] += impulse.totalVelocity.quad.m128_f32[0];
+					totalTargetVel.quad.m128_f32[1] += impulse.totalVelocity.quad.m128_f32[1];
+					totalTargetVel.quad.m128_f32[2] += impulse.totalVelocity.quad.m128_f32[2];
+				}
 
-					if (impulse.hasHorizontal) { anyHorizontalActive = true; }
-					if (impulse.hasVertical) { anyVerticalActive = true; }
-					if (!impulse.inflictDamage) {
-						anyNoDamageActive = true; // <--- Ativa o bloqueio de dano
-						StartNoDamageLandingProtection(a_actorID, actorPtr.get());
-					}
+				if (impulse.hasHorizontal) { anyHorizontalActive = true; }
+				if (impulse.hasVertical) { anyVerticalActive = true; }
+				if (!impulse.inflictDamage) {
+					anyNoDamageActive = true; // <--- Ativa o bloqueio de dano
+					StartNoDamageLandingProtection(a_actorID, actorPtr.get());
+				}
 
-					if (impulse.elapsedFrames < impulse.totalFrames) {
-						remainingImpulses.push_back(impulse);
-						if (impulse.hasVertical) {
-							anyVerticalRemaining = true;
-						}
-					}
+				remainingImpulses.push_back(impulse);
+				if (impulse.hasVertical) {
+					anyVerticalRemaining = true;
 				}
 			}
 
@@ -367,7 +389,15 @@ void ProcessActorImpulses(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
 	});
 }
 
-void ApplyCustomVelocityImpulse(RE::Actor* a_actor, float a_x, float a_y, float a_z, float a_time, bool a_inflictDamage)
+void ApplyCustomVelocityImpulse(
+	RE::Actor* a_actor,
+	float a_x,
+	float a_y,
+	float a_z,
+	float a_time,
+	bool a_inflictDamage,
+	bool a_allowMomentumHorizontal,
+	bool a_allowMomentumVertical)
 {
 	if (!a_actor) return;
 
@@ -391,8 +421,9 @@ void ApplyCustomVelocityImpulse(RE::Actor* a_actor, float a_x, float a_y, float 
 	RE::ActorHandle actorHandle = a_actor->GetHandle();
 
 	bool isSmooth = (a_time > 0.0f);
-	int durationFrames = isSmooth ? static_cast<int>(a_time * 60.0f) : 10;
-	if (durationFrames < 1) durationFrames = 1;
+	float durationSeconds = isSmooth ? a_time : (10.0f / 60.0f);
+	if (durationSeconds < 0.001f) durationSeconds = 0.001f;
+	const auto startTime = std::chrono::steady_clock::now();
 
 	// =========================================================================
 	// APLICAÇÃO IMEDIATA (FRAME 0 / ELAPSED = 1)
@@ -419,7 +450,7 @@ void ApplyCustomVelocityImpulse(RE::Actor* a_actor, float a_x, float a_y, float 
 	RE::hkVector4 currentVel;
 	charController->GetLinearVelocityImpl(currentVel);
 
-	float initialProgress = 1.0f / static_cast<float>(durationFrames);
+	float initialProgress = isSmooth ? (1.0f / 60.0f) / durationSeconds : 1.0f;
 	float easedMultiplier = isSmooth ? GetEasingProgress(initialProgress) : 1.0f;
 
 	if (hasHoriz) {
@@ -447,8 +478,9 @@ void ApplyCustomVelocityImpulse(RE::Actor* a_actor, float a_x, float a_y, float 
 			StartNoDamageLandingProtection(actorID, a_actor);
 		}
 
-		// Adiciona a_inflictDamage à tupla armazenada
-		g_ActiveImpulses[actorID].push_back({ impulseVel, hasHoriz, hasVert, 1, durationFrames, isSmooth, a_inflictDamage });
+		auto& impulses = g_ActiveImpulses[actorID];
+		RemoveMomentumChannels(impulses, hasHoriz && !a_allowMomentumHorizontal, hasVert && !a_allowMomentumVertical);
+		impulses.push_back({ impulseVel, hasHoriz, hasVert, startTime, durationSeconds, isSmooth, a_inflictDamage });
 
 		if (g_ActiveLoops.contains(actorID)) {
 			return;
@@ -620,6 +652,8 @@ void ApplyImpulseFFC::Process(RE::TESObjectREFR* a_holder, const std::string_vie
 		float z = 0.0f;
 		float time = 0.0f;
 		bool inflictDamage = true;
+		bool allowMomentumHorizontal = true;
+		bool allowMomentumVertical = true;
 
 		// Preenchimento incremental e seguro baseando-se no tamanho do vetor
 		if (args.size() >= 1) x = std::stof(args[0]);
@@ -633,9 +667,32 @@ void ApplyImpulseFFC::Process(RE::TESObjectREFR* a_holder, const std::string_vie
 				inflictDamage = false;
 			}
 		}
+		if (args.size() >= 6) {
+			std::string momentumHorizontalArg = args[5];
+			std::transform(momentumHorizontalArg.begin(), momentumHorizontalArg.end(), momentumHorizontalArg.begin(), ::tolower);
+			if (momentumHorizontalArg == "false" || momentumHorizontalArg == "0") {
+				allowMomentumHorizontal = false;
+			}
+		}
+		if (args.size() >= 7) {
+			std::string momentumVerticalArg = args[6];
+			std::transform(momentumVerticalArg.begin(), momentumVerticalArg.end(), momentumVerticalArg.begin(), ::tolower);
+			if (momentumVerticalArg == "false" || momentumVerticalArg == "0") {
+				allowMomentumVertical = false;
+			}
+		}
 
-		ApplyCustomVelocityImpulse(actor, x, y, z, time, inflictDamage);
-		SKSE::log::debug("ApplyForceFFC: Impulso processado [X:{}, Y:{}, Z:{}, Tempo:{}s, Dano:{}] no ator {:X}", x, y, z, time, inflictDamage, actor->GetFormID());
+		ApplyCustomVelocityImpulse(actor, x, y, z, time, inflictDamage, allowMomentumHorizontal, allowMomentumVertical);
+		SKSE::log::debug(
+			"ApplyForceFFC: Impulso processado [X:{}, Y:{}, Z:{}, Tempo:{}s, Dano:{}, MomentumH:{}, MomentumV:{}] no ator {:X}",
+			x,
+			y,
+			z,
+			time,
+			inflictDamage,
+			allowMomentumHorizontal,
+			allowMomentumVertical,
+			actor->GetFormID());
 	}
 	catch (...) {
 		SKSE::log::error("ApplyForceFFC: Erro crítico de conversão. Certifique-se de usar números válidos no payload: {}", a_payload);

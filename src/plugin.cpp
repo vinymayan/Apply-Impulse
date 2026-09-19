@@ -1,4 +1,5 @@
-﻿#include "logger.h"
+﻿#include "TCB_API.h"
+#include "logger.h"
 #include "PayloadAPI.h"
 #include "Events.h"
 #include "Hooks.h"
@@ -106,6 +107,9 @@ void PayloadInterpreterMessageListener(SKSE::MessagingInterface::Message* a_msg)
     }
 }
 void OnMessage(SKSE::MessagingInterface::Message* message) {
+    if (message->type == SKSE::MessagingInterface::kPostPostLoad) {
+        SKSE::log::info("TCB tracking API: {}", TCB_API::Connect() ? "connected" : "unavailable; using original behavior");
+    }
     if (message->type == SKSE::MessagingInterface::kPostLoad) {
         if (SKSE::GetMessagingInterface()->RegisterListener("PayloadInterpreter", PayloadInterpreterMessageListener)) {
             SKSE::log::info("Listener para PayloadInterpreter registrado com sucesso.");

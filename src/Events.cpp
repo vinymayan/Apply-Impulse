@@ -1,4 +1,6 @@
-﻿#include "Events.h"
+#include "Events.h"
+#include "TCB_API.h"
+#include "AttackMotion.h"
 #include <vector>
 #include <string>
 #include <sstream>
@@ -38,6 +40,8 @@ static float GetEasingProgress(float a_progress) {
 
 // --- ESTRUTURAS E REGISTROS DE FORÇA (IMPULSO) ---
 struct ActiveImpulse {
+	float localX = 0.0f;
+	float localY = 0.0f;
 	RE::hkVector4 totalVelocity; // Força total final alvo
 	bool hasHorizontal = false;
 	bool hasVertical = false;
@@ -64,6 +68,7 @@ static void RemoveMomentumChannels(std::vector<ActiveImpulse>& a_impulses, bool 
 		if (a_clearHorizontal) {
 			impulse.totalVelocity.quad.m128_f32[0] = 0.0f;
 			impulse.totalVelocity.quad.m128_f32[1] = 0.0f;
+			impulse.localX = impulse.localY = 0.0f;
 			impulse.hasHorizontal = false;
 		}
 
@@ -89,6 +94,28 @@ struct ActiveRotation {
 static std::map<RE::FormID, std::vector<ActiveRotation>> g_ActiveRotations;
 static std::set<RE::FormID> g_ActiveRotationLoops;
 static std::mutex g_RotationMutex;
+
+
+// API calls remain on the SKSE game thread. Only the TCB owns tracking state.
+static void ResolveTrackedVelocity(RE::Actor* actor, float x, float y, RE::hkVector4& velocity)
+{
+    float yaw;
+    if (TCB_API::api && TCB_API::api->TryGetMovementYaw(actor, yaw)) {
+        const float s = std::sin(yaw);
+        const float c = std::cos(yaw);
+        velocity.quad.m128_f32[0] = -c * x - s * y;
+        velocity.quad.m128_f32[1] =  s * x - c * y;
+    }
+    // Without tracking, retain the most recently resolved world direction.
+}
+
+static void ApplyRotationDelta(RE::Actor* actor, float delta)
+{
+    if (!actor || !std::isfinite(delta)) return;
+    if (TCB_API::api && TCB_API::api->AddAuthoredYawDelta(actor, delta)) return;
+    actor->GetActorRuntimeData().boolBits.reset(RE::Actor::BOOL_BITS::kHeadingFixed);
+    actor->SetHeading(actor->data.angle.z + delta);
+}
 
 static bool IsActorGrounded(RE::bhkCharacterController* a_charController)
 {
@@ -273,6 +300,10 @@ void ProcessActorImpulses(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
 					continue;
 				}
 
+				if (impulse.hasHorizontal) {
+					ResolveTrackedVelocity(actorPtr.get(), impulse.localX, impulse.localY, impulse.totalVelocity);
+				}
+
 				if (impulse.isSmooth) {
 					float progress = elapsedSeconds / durationSeconds;
 					float easedMultiplier = GetEasingProgress(progress);
@@ -454,6 +485,7 @@ void ApplyCustomVelocityImpulse(
 	float easedMultiplier = isSmooth ? GetEasingProgress(initialProgress) : 1.0f;
 
 	if (hasHoriz) {
+		ResolveTrackedVelocity(a_actor, a_x, a_y, impulseVel);
 		currentVel.quad.m128_f32[0] = impulseVel.quad.m128_f32[0] * easedMultiplier;
 		currentVel.quad.m128_f32[1] = impulseVel.quad.m128_f32[1] * easedMultiplier;
 	}
@@ -480,7 +512,7 @@ void ApplyCustomVelocityImpulse(
 
 		auto& impulses = g_ActiveImpulses[actorID];
 		RemoveMomentumChannels(impulses, hasHoriz && !a_allowMomentumHorizontal, hasVert && !a_allowMomentumVertical);
-		impulses.push_back({ impulseVel, hasHoriz, hasVert, startTime, durationSeconds, isSmooth, a_inflictDamage });
+		impulses.push_back({ a_x, a_y, impulseVel, hasHoriz, hasVert, startTime, durationSeconds, isSmooth, a_inflictDamage });
 
 		if (g_ActiveLoops.contains(actorID)) {
 			return;
@@ -554,8 +586,7 @@ void ProcessActorRotations(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
 
 	// Aplica a variação acumulada diretamente em cima do ângulo dinâmico atual do ator
 	if (std::abs(deltaYawTotal) > 0.00001f) {
-		actorPtr->GetActorRuntimeData().boolBits.reset(RE::Actor::BOOL_BITS::kHeadingFixed);
-		actorPtr->SetHeading(actorPtr->data.angle.z + deltaYawTotal);
+		ApplyRotationDelta(actorPtr.get(), deltaYawTotal);
 	}
 
 	// Sincronização idêntica ao sistema de impulso (Task + 16ms Delayed Dispatcher)
@@ -570,7 +601,7 @@ void ApplyCustomRotation(RE::Actor* a_actor, float a_yawDegrees, float a_time)
 {
 	if (!a_actor || a_actor->IsDead()) return;
 
-	if (a_actor->IsPlayerRef()) {
+	if (a_actor->IsPlayerRef() && !(TCB_API::api && TCB_API::api->IsActive(a_actor))) {
 		// Obtém o ponteiro da API do TDM (Versão 3)
 		if (auto* tdmAPI = static_cast<TDM_API::IVTDM3*>(TDM_API::RequestPluginAPI(TDM_API::InterfaceVersion::V3))) {
 			// Verifica se o player está com algum alvo travado
@@ -591,8 +622,7 @@ void ApplyCustomRotation(RE::Actor* a_actor, float a_yawDegrees, float a_time)
 
 	// Rotação instantânea (tempo zero) segura
 	if (a_time <= 0.0f) {
-		a_actor->GetActorRuntimeData().boolBits.reset(RE::Actor::BOOL_BITS::kHeadingFixed);
-		a_actor->SetHeading(a_actor->data.angle.z + yawRadians);
+		ApplyRotationDelta(a_actor, yawRadians);
 		return;
 	}
 
@@ -606,8 +636,7 @@ void ApplyCustomRotation(RE::Actor* a_actor, float a_yawDegrees, float a_time)
 	float initialEased = GetEasingProgress(initialProgress);
 	float deltaYawFrameZero = yawRadians * initialEased;
 
-	a_actor->GetActorRuntimeData().boolBits.reset(RE::Actor::BOOL_BITS::kHeadingFixed);
-	a_actor->SetHeading(a_actor->data.angle.z + deltaYawFrameZero);
+	ApplyRotationDelta(a_actor, deltaYawFrameZero);
 	// =========================================================================
 
 	{

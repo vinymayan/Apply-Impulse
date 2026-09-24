@@ -14,6 +14,7 @@ void ApplyCustomVelocityImpulse(
 	bool a_inflictDamage,
 	bool a_allowMomentumHorizontal = true,
 	bool a_allowMomentumVertical = true);
+bool ApplyRagdollImpulse(RE::Actor* a_actor, float a_x, float a_y, float a_z, bool a_inflictDamage);
 bool IsCollisionDamageSuppressed(RE::Actor* a_actor);
 void RestoreSuppressedCollisionHealth(RE::Actor* a_actor);
 

@@ -9,6 +9,10 @@ Function ApplyCustomVelocityImpulse(Actor akActor, Float x, Float y, Float z, Fl
 ; allowMomentumVertical controla soma/substituicao de z.
 Function ApplyCustomVelocityImpulseMomentum(Actor akActor, Float x, Float y, Float z, Float time, Bool inflictDamage = True, Bool allowMomentumHorizontal = True, Bool allowMomentumVertical = True) Global Native
 
+; Aplica impulso fisico a um ator que ja esta em ragdoll. Retorna False se nao houver corpos fisicos prontos.
+; x/y usam a direcao local do ator, z usa o eixo vertical do mundo.
+Bool Function ApplyRagdollImpulse(Actor akActor, Float x, Float y, Float z, Bool inflictDamage = True) Global Native
+
 ; Aplica rotacao yaw customizada em graus.
 Function ApplyCustomRotation(Actor akActor, Float yawDegrees, Float time) Global Native
 

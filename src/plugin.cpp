@@ -25,6 +25,11 @@ namespace PapyrusAPI
 		::ApplyCustomVelocityImpulse(a_actor, a_x, a_y, a_z, a_time, a_inflictDamage, a_allowMomentumHorizontal, a_allowMomentumVertical);
 	}
 
+	bool ApplyRagdollImpulse(RE::StaticFunctionTag*, RE::Actor* a_actor, float a_x, float a_y, float a_z, bool a_inflictDamage)
+	{
+		return ::ApplyRagdollImpulse(a_actor, a_x, a_y, a_z, a_inflictDamage);
+	}
+
 	void ApplyCustomRotation(RE::StaticFunctionTag*, RE::Actor* a_actor, float a_yawDegrees, float a_time)
 	{
 		::ApplyCustomRotation(a_actor, a_yawDegrees, a_time);
@@ -44,6 +49,7 @@ namespace PapyrusAPI
 	{
 		a_vm->RegisterFunction("ApplyCustomVelocityImpulse", "ApplyImpulse", ApplyCustomVelocityImpulse);
 		a_vm->RegisterFunction("ApplyCustomVelocityImpulseMomentum", "ApplyImpulse", ApplyCustomVelocityImpulseMomentum);
+		a_vm->RegisterFunction("ApplyRagdollImpulse", "ApplyImpulse", ApplyRagdollImpulse);
 		a_vm->RegisterFunction("ApplyCustomRotation", "ApplyImpulse", ApplyCustomRotation);
 		a_vm->RegisterFunction("IsCollisionDamageSuppressed", "ApplyImpulse", IsCollisionDamageSuppressed);
 		return true;
@@ -51,7 +57,7 @@ namespace PapyrusAPI
 }
 
 // Crie uma classe concreta que herda da interface e chama suas funções locais
-class FFCInterfaceImpl : public FFC_API::IFFCInterface {
+class FFCInterfaceImpl : public FFC_API::IFFCInterfaceV2 {
 public:
     void ApplyCustomVelocityImpulse(RE::Actor* a_actor, float a_x, float a_y, float a_z, float a_time, bool a_inflictDamage) override {
         // Chama a sua função original definida no Events.cpp com a nova flag
@@ -70,6 +76,10 @@ public:
 		::ApplyCustomVelocityImpulse(a_actor, a_x, a_y, a_z, a_time, a_inflictDamage, a_allowMomentumHorizontal, a_allowMomentumVertical);
 	}
 
+	bool ApplyRagdollImpulse(RE::Actor* a_actor, float a_x, float a_y, float a_z, bool a_inflictDamage) override {
+		return ::ApplyRagdollImpulse(a_actor, a_x, a_y, a_z, a_inflictDamage);
+	}
+
     void ApplyCustomRotation(RE::Actor* a_actor, float a_yawDegrees, float a_time) override {
         // Chama a sua função original definida no Events.cpp
         ::ApplyCustomRotation(a_actor, a_yawDegrees, a_time);
@@ -86,6 +96,11 @@ static FFCInterfaceImpl g_FFCInterface;
 extern "C" __declspec(dllexport) void* GetFFCAPI()
 {
     return &g_FFCInterface;
+}
+
+extern "C" __declspec(dllexport) void* GetFFCAPI2()
+{
+	return &g_FFCInterface;
 }
 
 void PayloadInterpreterMessageListener(SKSE::MessagingInterface::Message* a_msg)
@@ -121,6 +136,9 @@ void OnMessage(SKSE::MessagingInterface::Message* message) {
         SKSE::GetMessagingInterface()->Dispatch(FFC_API::kMessage_ProvideAPI, &g_FFCInterface, sizeof(&g_FFCInterface), message->sender);
         SKSE::log::info("FFC_API enviada para o mod: {}", message->sender);
     }
+	if (message->type == FFC_API::kMessage_RequestAPIV2) {
+		SKSE::GetMessagingInterface()->Dispatch(FFC_API::kMessage_ProvideAPIV2, &g_FFCInterface, sizeof(&g_FFCInterface), message->sender);
+	}
     if (message->type == SKSE::MessagingInterface::kNewGame || message->type == SKSE::MessagingInterface::kPostLoadGame) {
         // Post-load
     }

@@ -54,11 +54,13 @@ struct ActiveImpulse {
 struct NoDamageLandingProtection {
 	int graceFrames = 0;
 	float protectedHealth = 0.0f;
+	bool skipHealthRestore = false;
 };
 
 static std::map<RE::FormID, std::vector<ActiveImpulse>> g_ActiveImpulses;
 static std::set<RE::FormID> g_ActiveLoops;
 static std::map<RE::FormID, NoDamageLandingProtection> g_NoDamageLandingGrace;
+static std::set<RE::FormID> g_RagdollProtectionLoops;
 static std::mutex g_ImpulseMutex;
 static constexpr int kNoDamageLandingGraceFrames = 12;
 
@@ -166,6 +168,7 @@ static void RestoreSuppressedCollisionHealthLocked(RE::Actor* a_actor)
 	if (it == g_NoDamageLandingGrace.end()) {
 		return;
 	}
+	if (it->second.skipHealthRestore) return;
 
 	auto* avOwner = a_actor->AsActorValueOwner();
 	if (!avOwner) {
@@ -201,21 +204,30 @@ static void StartNoDamageLandingProtection(RE::FormID a_actorID, RE::Actor* a_ac
 	}
 }
 
-static bool UpdateNoDamageLandingProtection(RE::FormID a_actorID, RE::bhkCharacterController* a_charController)
+static bool UpdateNoDamageLandingProtection(RE::FormID a_actorID, RE::bhkCharacterController* a_charController, bool a_isRagdolled = false)
 {
+	if (a_isRagdolled) {
+		{
+			std::lock_guard<std::mutex> lock(g_ImpulseMutex);
+			auto it = g_NoDamageLandingGrace.find(a_actorID);
+			if (it == g_NoDamageLandingGrace.end()) return false;
+			it->second.graceFrames = kNoDamageLandingGraceFrames;
+		}
+		if (a_charController) DisableCollisionDamage(a_charController);
+		return true;
+	}
 	if (!a_charController) {
 		std::lock_guard<std::mutex> lock(g_ImpulseMutex);
 		g_NoDamageLandingGrace.erase(a_actorID);
 		return false;
 	}
 
-	DisableCollisionDamage(a_charController);
-
 	std::lock_guard<std::mutex> lock(g_ImpulseMutex);
 	auto it = g_NoDamageLandingGrace.find(a_actorID);
 	if (it == g_NoDamageLandingGrace.end()) {
 		return false;
 	}
+	DisableCollisionDamage(a_charController);
 
 	if (IsActorGrounded(a_charController)) {
 		it->second.graceFrames--;
@@ -230,6 +242,24 @@ static bool UpdateNoDamageLandingProtection(RE::FormID a_actorID, RE::bhkCharact
 	}
 
 	return true;
+}
+
+static void ProcessRagdollDamageProtection(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
+{
+	auto actor = a_actorHandle.get();
+	if (!actor || actor->IsDead() ||
+		!UpdateNoDamageLandingProtection(a_actorID, actor->GetCharController(), actor->IsInRagdollState())) {
+		std::lock_guard<std::mutex> lock(g_ImpulseMutex);
+		g_RagdollProtectionLoops.erase(a_actorID);
+		if (!actor || actor->IsDead()) g_NoDamageLandingGrace.erase(a_actorID);
+		return;
+	}
+
+	Utils::DelayedDispatcher::Get().PostDelayed(std::chrono::milliseconds(16), [a_actorHandle, a_actorID]() {
+		SKSE::GetTaskInterface()->AddTask([a_actorHandle, a_actorID]() {
+			ProcessRagdollDamageProtection(a_actorHandle, a_actorID);
+		});
+	});
 }
 
 bool IsCollisionDamageSuppressed(RE::Actor* a_actor)
@@ -351,7 +381,7 @@ void ProcessActorImpulses(RE::ActorHandle a_actorHandle, RE::FormID a_actorID)
 	if (!anyHorizontalActive && !anyVerticalActive) {
 		RestoreDefaultFallPhysics(charController);
 
-		if (UpdateNoDamageLandingProtection(a_actorID, charController)) {
+		if (UpdateNoDamageLandingProtection(a_actorID, charController, actorPtr->IsInRagdollState())) {
 			Utils::DelayedDispatcher::Get().PostDelayed(std::chrono::milliseconds(5), [a_actorHandle, a_actorID]() {
 				SKSE::GetTaskInterface()->AddTask([a_actorHandle, a_actorID]() {
 					ProcessActorImpulses(a_actorHandle, a_actorID);
@@ -525,6 +555,73 @@ void ApplyCustomVelocityImpulse(
 			ProcessActorImpulses(actorHandle, actorID);
 			});
 		});
+}
+
+bool ApplyRagdollImpulse(RE::Actor* a_actor, float a_x, float a_y, float a_z, bool a_inflictDamage)
+{
+	if (!a_actor || !a_actor->IsInRagdollState() ||
+		!std::isfinite(a_x) || !std::isfinite(a_y) || !std::isfinite(a_z) ||
+		(a_x == 0.0f && a_y == 0.0f && a_z == 0.0f)) return false;
+
+	RE::BSTSmartPointer<RE::BSAnimationGraphManager> graphManager;
+	a_actor->GetAnimationGraphManager(graphManager);
+	auto* cell = a_actor->GetParentCell();
+	auto* world = cell ? cell->GetbhkWorld() : nullptr;
+	if (!graphManager || !world) return false;
+
+	float worldX = 0.0f;
+	float worldY = 0.0f;
+	if (a_x != 0.0f || a_y != 0.0f) {
+		auto* controller = a_actor->GetCharController();
+		if (!controller) return false;
+		const auto forward = controller->forwardVec;
+		const RE::hkVector4 up{ 0.0f, 0.0f, 1.0f, 0.0f };
+		const auto right = up.Cross(forward);
+		worldX = right.quad.m128_f32[0] * a_x - forward.quad.m128_f32[0] * a_y;
+		worldY = right.quad.m128_f32[1] * a_x - forward.quad.m128_f32[1] * a_y;
+	}
+
+	constexpr float kGameToHavokScale = 0.0142875f;
+	const RE::hkVector4 velocity{
+		worldX * kGameToHavokScale,
+		worldY * kGameToHavokScale,
+		a_z * kGameToHavokScale,
+		0.0f };
+
+	for (const auto& graph : graphManager->graphs) {
+		if (!graph) continue;
+		const auto* driver = graph->characterInstance.ragdollDriver.get();
+		const auto* ragdoll = driver ? driver->ragdoll : nullptr;
+		if (!ragdoll || ragdoll->rigidBodies.empty()) continue;
+
+		std::size_t pushed = 0;
+		{
+			RE::BSWriteLockGuard lock(world->worldLock);
+			for (auto* body : ragdoll->rigidBodies) {
+				if (!body || !body->world) continue;
+				const float mass = body->motion.GetMass();
+				if (mass <= 0.0f) continue;
+				body->ApplyLinearImpulse(velocity * mass);
+				++pushed;
+			}
+		}
+		if (pushed == 0) continue;
+
+		if (!a_inflictDamage && !a_actor->IsDead()) {
+			const auto actorID = a_actor->GetFormID();
+			bool startLoop = false;
+			{
+				std::lock_guard<std::mutex> lock(g_ImpulseMutex);
+				StartNoDamageLandingProtection(actorID, a_actor);
+				g_NoDamageLandingGrace[actorID].skipHealthRestore = true;
+				startLoop = g_RagdollProtectionLoops.insert(actorID).second;
+			}
+			if (auto* controller = a_actor->GetCharController()) DisableCollisionDamage(controller);
+			if (startLoop) ProcessRagdollDamageProtection(a_actor->GetHandle(), actorID);
+		}
+		return true;
+	}
+	return false;
 }
 
 
